@@ -57,18 +57,36 @@ class VoxelizedMeatball:
         self.fields = {}
         self.angles = None
         self.grain_ids = None
-        if grain_map:
+        if grain_map is not None:
+            if not isinstance(grain_map, np.ndarray):
+                raise TypeError("Error: grain_map must be a NumPy array!")
+            if grain_map.ndim == 2:
+                # Convert 2D to pseudo-3D by stacking along the third axis
+                grain_map = np.stack([grain_map, grain_map], axis=-1)
+            elif grain_map.ndim != 3:
+                raise ValueError("Error: grain_map must be either 2D or 3D!")
+
             self.__initialize_grain_map(grain_map)
-            if angle_list:
-                # TODO: sanity check for type and size according to grain map
+            if angle_list is not None:
                 # TODO: should the angle_list be a dictionary to be less error-prone in case labels are not 1,2,3,...?
-                self.angles = angle_list
+                if isinstance(angle_list, np.ndarray):
+                    if angle_list.ndim != 2:
+                        raise ValueError(f"angle_list must be a 2D NumPy array of shape [{len(self.grain_ids)}, 3]")
+                    dim1, dim2 = angle_list.shape
+                    if dim1 == len(self.grain_ids) and dim2 == 3:
+                        self.angles = angle_list
+                    else:
+                        raise ValueError(f"angle_list must have shape [{len(self.grain_ids)}, 3], but got {angle_list.shape}")
+                else:
+                    raise TypeError("angle_list must be a NumPy array!")
         else:
-            if angle_list:
+            if angle_list is not None:
                 raise ValueError("Angle list but no corresponding grain map has been given!")
             warnings.warn("Empty initialization. Please generate a grain structure!")
 
     def __initialize_grain_map(self, grain_map):
+        if 'grains' in self.fields:
+            warnings.warn("Previous grain map will be over-written!")
         self.fields['grains'] = grain_map
         self.Nx, self.Ny, self.Nz = grain_map.shape
         self.domain_size = (self.spacing[0]*self.Nx, self.spacing[1]*self.Ny, self.spacing[2]*self.Nz)
@@ -79,22 +97,21 @@ class VoxelizedMeatball:
         self.grain_ids = labels[labels > 0]
 
     def create_random_agglomerate(self, radius: int, num_seeds: int):
-        # TODO: warning if previous grain map is over-written
         grains, angles = create_NMC_agglomerate([radius], [num_seeds])
         self.__initialize_grain_map(grains)
         self.angles = angles
 
     def create_structured_agglomerate(self, radii, num_seeds):
-        # TODO: warning if previous grain map is over-written
         grains, angles = create_NMC_agglomerate(radii, num_seeds)
         self.__initialize_grain_map(grains)
         self.angles = angles
 
     def add_random_orientations(self):
-        # TODO: warning if previous orientations are over-written
+        if self.angles is not None:
+            warnings.warn("Previous angles will be over-written!")
         if self.grain_ids:
-            print("Generating random orientations!")
-            self.angles = 180*np.random.rand(len(grain_ids), 3)
+            print("Generating random orientations...")
+            self.angles = 180*np.random.rand(len(self.grain_ids), 3)
         else:
             raise ValueError("Cannot add orientations to non-existing grains. Create grains first.")
 

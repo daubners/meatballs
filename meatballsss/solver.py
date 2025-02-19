@@ -6,7 +6,7 @@ from timeit import default_timer as timer
 # import psutil
 from scipy.spatial.transform import Rotation as rot
 import torch
-# import torch.fft as fft
+import torch.fft as fft
 import torch.nn.functional as F
 import warnings
 from .fields import VoxelizedMeatball
@@ -30,9 +30,11 @@ class PITTSolver:
         self.precision = torch.float32 # torch.float64
 
         self.grains = torch.tensor(data.fields['grains'], dtype=self.precision, device=self.device)
-        self.mask = (self.grains == 0).float()
-        self.mask = self.mask.unsqueeze(0)
+        self.electrolyte = (self.grains == 0).float()
+        self.electrolyte[self.electrolyte==1] = torch.inf
+        self.electrolyte[self.electrolyte==0] = 1
         self.c = torch.zeros_like(self.grains)
+        self.electrolyte = self.electrolyte.unsqueeze(0)
 
         if not diffusivity:
             self.D_material = np.eye(3)
@@ -69,11 +71,11 @@ class PITTSolver:
             mask = mask.unsqueeze(0).unsqueeze(0)
             mask = F.pad(mask, (pad_size,pad_size,pad_size,pad_size,pad_size,pad_size), mode='replicate')
             mask = F.conv3d(mask, gaussian, padding='valid')
-            mask = mask.squeeze()
+            mask = mask.squeeze(0).squeeze(0)
             D_grain = self.rotate_crystal_diffusivity_to_reference(data.angles[i], convention='ZXZ', degrees=True)
             self.Dxx += mask*D_grain[0,0]
             self.Dxy += mask*D_grain[0,1]
-            self.Dxy += mask*D_grain[0,2]
+            self.Dxz += mask*D_grain[0,2]
             self.Dyy += mask*D_grain[1,1]
             self.Dyz += mask*D_grain[1,2]
             self.Dzz += mask*D_grain[2,2]
@@ -99,7 +101,7 @@ class PITTSolver:
             sys.exit(1)  # Exit the program with an error status
         if vtk_out:
             filename = f"PITT_c_{self.frame:03d}.vtk"
-            self.data.export_to_vtk(filename=filename, field_names=['concentration'])
+            self.data.export_fields_to_vtk(filename=filename, field_names=['concentration'])
         if verbose == 'plot':
             clear_output(wait=True)
             self.data.plot_slice('concentration', slice, time=self.time)
@@ -156,6 +158,15 @@ class PITTSolver:
         D_xyz = r_matrix @ self.D_material @ r_matrix.T
         return torch.tensor(D_xyz, dtype=self.precision, device=self.device)
 
+    def initialise_FFT_wavenumbers(self):
+        dx, dy, dz = self.data.spacing
+        kx = 2 * torch.pi * fft.fftfreq(self.data.Nx, d=dx, device=self.device)
+        ky = 2 * torch.pi * fft.fftfreq(self.data.Ny, d=dy, device=self.device)
+        kz = 2 * torch.pi * fft.fftfreq(self.data.Nz, d=dz, device=self.device)
+        kx, ky, kz = torch.meshgrid(kx, ky, kz, indexing="ij")
+
+        return kx, ky, kz, kx**2 + ky**2 + kz**2
+
     def calc_grad_x(self, tensor):
         return (  tensor[:, 1: , 1: , 1:] + tensor[:, 1: , 1: , :-1] \
                 + tensor[:, 1: , :-1, 1:] + tensor[:, 1: , :-1, :-1] \
@@ -174,7 +185,7 @@ class PITTSolver:
                 - tensor[:, 1: , 1:, :-1] - tensor[:, 1: , :-1, :-1] \
                 - tensor[:, :-1, 1:, :-1] - tensor[:, :-1, :-1, :-1] ) / 4
 
-    def solve(self, time_increment=0.01, frames=10, max_iters=1000, bc=1, verbose=True, vtk_out=False):
+    def solve(self, time_increment=0.01, frames=10, max_iters=1000, bc=1, A = 0.25, verbose=True, vtk_out=False):
         """
         Solves concentration evolution using explicit timestepping.
         """
@@ -183,20 +194,22 @@ class PITTSolver:
         self.n_out = int(max_iters/frames)
         self.frame = 0
         self.time = 0
+        _, _, _, k_squared = self.initialise_FFT_wavenumbers()
+        self.c[self.grains == 0] = bc
         self.c = self.c.unsqueeze(0)
         slice = int(self.c.shape[-1]/2)
         with torch.no_grad():
             start = timer()
             for i in range(max_iters):
+                # Apply electrolyte boundary conditions
+                # Set c=bc in all electrolyte cells
+                # self.c *= (1-self.electrolyte)
+                # self.c += self.electrolyte * bc
+                
                 if i % self.n_out == 0:
                     self.time = i*time_increment
                     self.handle_outputs(vtk_out, verbose, slice=slice)
                     self.frame += 1
-
-                # Apply electrolyte boundary conditions
-                # Set c=bc in all electrolyte cells
-                self.c *= (1-self.mask)
-                self.c += self.mask * bc
 
                 grad = self.calc_grad_x(self.c)
                 flux_x = self.Dxx*grad
@@ -206,11 +219,11 @@ class PITTSolver:
                 grad = self.calc_grad_y(self.c)
                 flux_x += self.Dxy*grad
                 flux_y += self.Dyy*grad
-                # flux_z += self.Dyz*grad
+                flux_z += self.Dyz*grad
 
                 grad = self.calc_grad_z(self.c)            
                 flux_x += self.Dxz*grad
-                # flux_y += self.Dyz*grad
+                flux_y += self.Dyz*grad
                 flux_z += self.Dzz*grad
 
                 # Add Neumann boundary conditions
@@ -218,9 +231,20 @@ class PITTSolver:
                 flux_y = F.pad(flux_y, (1,1,1,1,1,1), mode='constant')
                 flux_z = F.pad(flux_z, (1,1,1,1,1,1), mode='constant')
 
-                self.c += time_increment * (self.calc_grad_x(flux_x) + \
-                                            self.calc_grad_y(flux_y) + \
-                                            self.calc_grad_z(flux_z) )
+                # self.c += time_increment * (self.calc_grad_x(flux_x) + \
+                #                             self.calc_grad_y(flux_y) + \
+                #                             self.calc_grad_z(flux_z) ) /self.electrolyte
+                divergence = (self.calc_grad_x(flux_x) + \
+                              self.calc_grad_y(flux_y) + \
+                              self.calc_grad_z(flux_z) ) /self.electrolyte
+                flux_div = fft.fftn(divergence)
+
+                c_hat = fft.fftn(self.c)
+                # Update c_hat using semi-implicit scheme
+                c_hat += time_increment*flux_div / (1 + time_increment*k_squared*A)
+
+                # Transform back to real space
+                self.c = torch.real(fft.ifftn(c_hat))
 
             end = timer()
             self.time = max_iters*time_increment

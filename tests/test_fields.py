@@ -24,3 +24,5 @@ def test_voxelFields_init_fields():
     a.add_field("c", 0.123*np.ones((a.Nx, a.Ny, a.Nz)))
 
     assert (a.fields['c'][1,2,3], *a.fields['c'].shape) == (0.123, 16, 16, 16)
+
+# test centers of grains

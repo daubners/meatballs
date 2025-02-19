@@ -1,13 +1,12 @@
 import numpy as np
 from scipy.spatial import KDTree
-
+from scipy.spatial.transform import Rotation as rot
 
 def generate_random_points_within_sphere(num_points, radius):
     points = np.random.randn(num_points, 3)
     points /= np.linalg.norm(points, axis=1)[:, np.newaxis]
     points *= (np.random.rand(num_points, 1) ** (1/3)) * radius
     return points
-
 
 def generate_fibonacci_points_on_sphere(num_points, radius):
     phi = np.pi * (np.sqrt(5.) - 1.)  # golden angle in radians
@@ -22,7 +21,6 @@ def generate_fibonacci_points_on_sphere(num_points, radius):
 
     points = np.vstack((x, y * radius, z)).T
     return points
-
 
 def create_NMC_agglomerate(radii, num_seeds, padding=5, return_seeds=False):
     # Radii should be sorted from smallest to largest
@@ -42,7 +40,37 @@ def create_NMC_agglomerate(radii, num_seeds, padding=5, return_seeds=False):
     
     # elyte_seeds = generate_fibonacci_points_on_sphere(num_seeds[-1], (3*radii[-1]-radii[-2])/2)
     # seeds = np.concatenate((seeds,elyte_seeds),axis=0)
-    
+
+    # Add orientations and start with random list
+    # angle_list = 180*np.random.rand(np.sum(num_seeds), 3)
+    # Last angle is defined in [0,120]
+    angle_list = np.column_stack((180*np.random.rand(np.sum(num_seeds), 2), 120*np.random.rand(np.sum(num_seeds), 1)))
+    # Add orientations for radially aligned grains given in Bunge convention
+    #  φ1 (phi1): Rotation angle about the Z-axis of the standard reference frame.
+    #  Φ (Phi): Rotation angle about the X-axis of the intermediate frame obtained after the first rotation.
+    #  φ2 (phi2): Rotation angle about the Z-axis of the final frame obtained after the first two rotations.
+    # --> φ1 and Φ are given by seed position, φ2 can be random.
+    if len(radii) > 1:
+        yaw = np.arctan2(seeds[num_seeds[0]:,1],seeds[num_seeds[0]:,0]) * 180 / np.pi
+        r = np.linalg.norm(seeds[num_seeds[0]:], axis=1)
+        pitch = np.arcsin(-seeds[num_seeds[0]:,2] / r) * 180 / np.pi
+        roll = 180*np.random.rand(np.sum(num_seeds[1:]), 1)
+        ypr_angles = np.column_stack((yaw, pitch, roll))
+        rot_obj = rot.from_euler('ZYX', ypr_angles, degrees=True)
+        bunge_angles = rot_obj.as_euler('ZXZ', degrees=True)
+        change_signs = bunge_angles[:,0]<0
+        bunge_angles[change_signs, 0] += 180
+        bunge_angles[change_signs, 1] *= -1
+
+        change_signs = bunge_angles[:,1]<0
+        bunge_angles[change_signs, 1] += 180
+        bunge_angles[change_signs, 2] *= -1
+
+        bunge_angles[bunge_angles[:,2]<0, 2] += 120
+        bunge_angles[bunge_angles[:,2]<0, 2] += 120
+        bunge_angles[bunge_angles[:,2]>=120, 2] -= 120
+        angle_list[num_seeds[0]:,:] = bunge_angles
+
     # Shift seeds to box center
     seeds += center
 
@@ -65,10 +93,6 @@ def create_NMC_agglomerate(radii, num_seeds, padding=5, return_seeds=False):
 
     # mask = grain_id > np.sum(num_seeds)
     grain_id[mask] = 0
-
-    # TODO: just random orientations for now
-    # Add orientations for radially aligned grains
-    angle_list = 180*np.random.rand(np.sum(num_seeds), 3)
 
     if return_seeds:
         return grain_id, angle_list, seeds

@@ -14,6 +14,7 @@ from matplotlib.widgets import Slider
 import numpy as np
 import pyvista as pv
 import warnings
+from scipy.spatial.transform import Rotation as rot
 from .utils import create_NMC_agglomerate
 
 class VoxelizedMeatball:
@@ -37,7 +38,10 @@ class VoxelizedMeatball:
     def __init__(self, grain_map = None, angle_list = None, spacing = None):
         """
         Initializes the voxel agglomerate based on given grain map or empty.
-
+        Parameters:
+            grain_map (np.ndarray): A 3D numpy array of shape (Nx, Ny, Nz) where each voxel is labelled with a unique grain ID.
+            angle_list (np.ndarray): List of orientations corresponding to labelled grains.
+            spacing (tuple or list or np.ndarray): The voxel spacing in the x, y, z directions (dx, dy, dz).
         Raises:
             ValueError: If spacing is not a list or tuple with three elements or contains non-numeric values.
             Warning: If spacings differ significantly, a warning is issued.
@@ -96,6 +100,25 @@ class VoxelizedMeatball:
             warnings.warn("Electrolyte is assumed to have label 0, but no pixel with label 0 was found!")
         self.grain_ids = labels[labels > 0]
 
+    def __compute_grain_centers(self, field):
+        """
+        Compute the center of mass for each grain in a labelled pixel/voxel grid.
+        Works for both 2D slices and 3D grids.
+        Returns:
+            np.ndarray: An array of shape (num_grains, D) where D is the number of dimensions,
+                    containing the center of mass for each grain.
+        """ 
+        dim = field.ndim
+        grain_centers = np.zeros((len(self.grain_ids), dim))
+        
+        for i, label in enumerate(self.grain_ids):
+            # Find voxel indices (i, j, k) where the voxel belongs to the current grain.
+            indices = np.argwhere(field == label)  # shape: (N_points, 3)
+            mean_indices = np.mean(indices, axis=0)  # [mean_x, mean_y, mean_z]
+            grain_centers[i] = self.origin + mean_indices * self.spacing
+
+        return grain_centers
+
     def create_random_agglomerate(self, radius: int, num_seeds: int):
         grains, angles = create_NMC_agglomerate([radius], [num_seeds])
         self.__initialize_grain_map(grains)
@@ -106,12 +129,15 @@ class VoxelizedMeatball:
         self.__initialize_grain_map(grains)
         self.angles = angles
 
-    def add_random_orientations(self):
+    def add_random_orientations(self, angle_range=[180,180,120]):
         if self.angles is not None:
             warnings.warn("Previous angles will be over-written!")
         if self.grain_ids:
             print("Generating random orientations...")
-            self.angles = 180*np.random.rand(len(self.grain_ids), 3)
+            # Per default last angle is defined between 0 and 120 degrees (hexagonal unit cell)
+            self.angles = np.column_stack((angle_range[0]*np.random.rand(len(self.grain_ids), 1), \
+                                           angle_range[1]*np.random.rand(len(self.grain_ids), 1), \
+                                           angle_range[2]*np.random.rand(len(self.grain_ids), 1)))
         else:
             raise ValueError("Cannot add orientations to non-existing grains. Create grains first.")
 
@@ -161,7 +187,42 @@ class VoxelizedMeatball:
         else:
             self.fields[name] = np.zeros((self.Nx, self.Ny, self.Nz))
 
-    def export_to_vtk(self, filename="output.vtk", field_names=None):
+    def generate_color_map(self, normalize_angles=[180,180,120]):
+        if 'grains' in self.fields:
+            if self.angles is not None:
+                print("Generating colormap from grain_map and angle_list.")
+                colormap = np.zeros((self.Nx, self.Ny, self.Nz, 3))
+                for i, label in enumerate(self.grain_ids):
+                    colormap[self.fields['grains']==label] = self.angles[i]/normalize_angles
+                return colormap
+            else:
+                raise ValueError("Create orientations before trying to generate color map.")
+        else:
+            raise ValueError("Add grain_map before trying to generate color map.")
+
+    def export_orientations_to_vtk(self, filename="orientations.vtk"):
+        """
+        Exports orientations as vector data to a VTK file for visualization (e.g. VisIt or ParaView).
+        Args:
+            filename (str): Name of the output VTK file.
+        """
+        centers = self.__compute_grain_centers(self.fields['grains'])
+        a_axis = np.zeros((len(self.grain_ids), 3))
+        b_axis = np.zeros((len(self.grain_ids), 3))
+        c_axis = np.zeros((len(self.grain_ids), 3))
+        for i, label in enumerate(self.grain_ids):
+            Q = rot.from_euler('ZXZ', self.angles[i], degrees=True).as_matrix()
+            a_axis[i] = Q @ np.array([1, 0, 0])
+            b_axis[i] = Q @ np.array([0, 1, 0])
+            c_axis[i] = Q @ np.array([0, 0, 1])
+
+        point_cloud = pv.PolyData(centers)
+        point_cloud["a_axis"] = a_axis
+        point_cloud["b_axis"] = b_axis
+        point_cloud["c_axis"] = c_axis
+        point_cloud.save(filename)
+
+    def export_fields_to_vtk(self, filename="fields.vtk", field_names=None):
         """
         Exports fields to a VTK file for visualization (e.g. VisIt or ParaView).
 

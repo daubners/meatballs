@@ -8,14 +8,18 @@
 # So embrace the charm of this edgy place,
 # Where every voxel finds its space
 
-from IPython.display import clear_output
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
 import numpy as np
 import pyvista as pv
 import warnings
+
+from IPython.display import clear_output
+from matplotlib.widgets import Slider
+from matplotlib.patches import Ellipse
 from scipy.spatial.transform import Rotation as rot
-from .utils import create_NMC_agglomerate
+from skimage.segmentation import find_boundaries
+from sklearn.decomposition import PCA
+from .utils import create_NMC_agglomerate, normalize_angles
 
 class VoxelizedMeatball:
     """
@@ -100,7 +104,7 @@ class VoxelizedMeatball:
             warnings.warn("Electrolyte is assumed to have label 0, but no pixel with label 0 was found!")
         self.grain_ids = labels[labels > 0]
 
-    def __compute_grain_centers(self, field):
+    def compute_grain_centers(self, field):
         """
         Compute the center of mass for each grain in a labelled pixel/voxel grid.
         Works for both 2D slices and 3D grids.
@@ -129,10 +133,44 @@ class VoxelizedMeatball:
         self.__initialize_grain_map(grains)
         self.angles = angles
 
+    def color_array_to_grain_map(self, img_array, tolerance=0):
+        """
+        Convert a segmented color image to a grainmap with unique IDs.
+        If the image is 2D (i.e. no explicit depth dimension), a pseudo-3D grain map is created
+        by stacking the 2D label map along a new axis.
+        
+        Parameters:
+            img_array (np.ndarray): Input image array.
+            tolerance (int): Tolerance for color matching (currently not implemented)
+        """
+        # Remove the alpha channel if present.
+        if img_array.shape[-1] == 4:
+            img_array = img_array[..., :3]
+        
+        # Check if the image is 2D or 3D based on the number of spatial dimensions.
+        if img_array.ndim == 3:  # 2D image with shape (H, W, 3)
+            spatial_shape = img_array.shape[:2]
+        elif img_array.ndim == 4:  # 3D image with shape (X, Y, Z, 3)
+            spatial_shape = img_array.shape[:3]
+        else:
+            raise ValueError("Unsupported input dimensions. Expecting a 2D or 3D RGB image.")
+        # Reshape to a list of pixels
+        pixels = img_array.reshape(-1, 3)
+        
+        # If a tolerance is set, additional post-processing would be required here.
+        # For simplicity, we assume tolerance==0 (exact matching).
+        _, inverse_indices = np.unique(pixels, axis=0, return_inverse=True)
+        grains = inverse_indices.reshape(spatial_shape)
+
+        if grains.ndim == 2:
+            grains = np.stack([grains, grains], axis=-1)
+        self.__initialize_grain_map(grains)
+        self.angles = None
+
     def add_random_orientations(self, angle_range=[180,180,120]):
         if self.angles is not None:
             warnings.warn("Previous angles will be over-written!")
-        if self.grain_ids:
+        if self.grain_ids is not None:
             print("Generating random orientations...")
             # Per default last angle is defined between 0 and 120 degrees (hexagonal unit cell)
             self.angles = np.column_stack((angle_range[0]*np.random.rand(len(self.grain_ids), 1), \
@@ -141,11 +179,51 @@ class VoxelizedMeatball:
         else:
             raise ValueError("Cannot add orientations to non-existing grains. Create grains first.")
 
-    def guess_grain_orientation_from_shape(self):
-        print("Estimating grain orientations from crystal shapes!")
-        # Assuming that the orientation of the smalles half-axis in PCA space
-        # coresponds to the c-axis (because that is the slowest growing crystal axis).
-        # angle_list = self.guess_grain_orientation_from_shape()
+    def guess_grain_orientation_from_shape(self, voxel_threshold=3):
+        """
+        Compute the orientation of each grain in a 3D labelled voxel grid based on its shape,
+        and return the corresponding Euler angles [φ₁, Φ, φ₂] in the Bunge ZXZ convention.
+        If a grain has fewer than voxel_threshold voxels, a rotation of [0,0,0] is returned per default.
+
+        For each grain (with label > 0):
+        - PCA is performed on the voxel coordinates.
+        - Eigenvector with largest eigenvalue (longest dimension) is taken as the a‑axis.
+        - Eigenvector with smallest eigenvalue (shortest dimension) is taken as the c‑axis
+          because that is the slowest growing crystal axis.
+        - The b‑axis is implicitly given as the second principal component.
+        """
+        if self.angles is not None:
+            warnings.warn("Previous angles will be over-written!")
+        if self.grain_ids is not None:
+            print("Estimating grain orientations from crystal shapes!")
+            bunge_angles = np.zeros((len(self.grain_ids), 3))
+            
+            for i, label in enumerate(self.grain_ids):
+                grain_mask = (self.fields['grains'] == label)
+                points = np.column_stack(np.where(grain_mask)) # shape (n_points, 3)
+                
+                # Check if there are enough points to perform a meaningful 3D PCA.
+                if points.shape[0] < voxel_threshold:
+                    continue
+                
+                # Perform PCA on the voxel coordinates.
+                pca = PCA(n_components=3)
+                pca.fit(points)
+                # PCA components are sorted in order of descending variance:
+                # The first component is the a-axis (longest dimension),
+                # the third is the c-axis (shortest dimension).
+                # Transpose of pca.components_ corresponds to rotation matrix
+                R_matrix = pca.components_.T
+                # Make sure this is a right-handed rotation system
+                if np.linalg.det(R_matrix) < 0:
+                    R_matrix[:, 2] *= -1
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Gimbal lock detected.*", category=UserWarning)
+                    bunge_angles[i] = rot.from_matrix(R_matrix).as_euler('ZXZ', degrees=True)
+            bunge_angles = normalize_angles(bunge_angles)
+            self.angles = bunge_angles
+        else:
+            raise ValueError("Cannot add orientations to non-existing grains. Create grains first.")
 
     def relabel_random_order(self):
         old_labels = np.unique(self.fields['grains'])
@@ -206,7 +284,7 @@ class VoxelizedMeatball:
         Args:
             filename (str): Name of the output VTK file.
         """
-        centers = self.__compute_grain_centers(self.fields['grains'])
+        centers = self.compute_grain_centers(self.fields['grains'])
         a_axis = np.zeros((len(self.grain_ids), 3))
         b_axis = np.zeros((len(self.grain_ids), 3))
         c_axis = np.zeros((len(self.grain_ids), 3))
@@ -300,15 +378,15 @@ class VoxelizedMeatball:
         """
         if direction == 'x':
             axes = (0,1,2)
-            end1, end2 = self.spacing[1], self.spacing[2]
+            end1, end2 = self.domain_size[1], self.domain_size[2]
             label1, label2 = ['Y', 'Z']
         elif direction == 'y':
             axes = (1,0,2)
-            end1, end2 = self.spacing[0], self.spacing[2]
+            end1, end2 = self.domain_size[0], self.domain_size[2]
             label1, label2 = ['X', 'Z']
         elif direction == 'z':
             axes = (2,0,1)
-            end1, end2 = self.spacing[0], self.spacing[1]
+            end1, end2 = self.domain_size[0], self.domain_size[1]
             label1, label2 = ['X', 'Y']
         else:
             raise ValueError("Given direction must be x, y or z")
@@ -334,3 +412,89 @@ class VoxelizedMeatball:
 
         ax_slider.on_changed(update)
         return ax_slider
+    
+    def plot_slice_with_orientations(self, slice_index, direction='z', show_ids=False, colormap='viridis'):
+        """
+        Plots a 2D slice of a labelled grain map and overlays grain orientation arrows.
+        
+        For each grain that is visible in the slice, the function computes the 2D center of the grain
+        (from pixels in the slice) and overlays an arrow representing the projection of the grain's 
+        c-axis (derived from the provided Euler angles using the Bunge ZXZ convention) onto the slice plane.
+        
+        Parameters:
+            slice_index (int): The index of the slice to plot.
+            direction (str): The normal direction of the slice ('x', 'y', or 'z').
+            show_ids (bool): If True, overlay the grain IDs at the computed grain centers.
+            colormap (str): Colormap used for displaying the slice.
+        """
+        if direction == 'x':
+            slice = np.s_[slice_index, :, :]
+            end1, end2 = self.domain_size[1], self.domain_size[2]
+            label1, label2 = 'Y', 'Z'
+        elif direction == 'y':
+            slice = np.s_[:, slice_index, :]
+            end1, end2 = self.domain_size[0], self.domain_size[2]
+            label1, label2 = 'X', 'Z'
+        elif direction == 'z':
+            slice = np.s_[:, :, slice_index]
+            end1, end2 = self.domain_size[0], self.domain_size[1]
+            label1, label2 = 'X', 'Y'
+        else:
+            raise ValueError("Direction must be 'x', 'y', or 'z'.")
+
+        # Extract the 2D slice.
+        slice_img = self.fields['grains'][slice]
+        visible_grains = np.unique(slice_img)
+        visible_grains = visible_grains[visible_grains != 0]
+        masked_slice_img = np.ma.masked_equal(slice_img, 0)
+        cmap = plt.get_cmap(colormap).copy()
+        cmap.set_bad(color='black')
+
+        boundaries = find_boundaries(slice_img, mode='inner')
+
+        plt.figure(figsize=(10, 10))
+        im = plt.imshow(masked_slice_img.T, cmap=cmap, origin='lower', extent=[0, end1, 0, end2])
+        plt.contour(boundaries.T, colors='gray', linewidths=0.5)
+        plt.colorbar(im)
+        plt.xlabel(label1)
+        plt.ylabel(label2)
+        plt.title(f'Slice {slice_index} along {direction}')
+        ax = plt.gca()
+
+        for grain_id in visible_grains:
+            indices = np.argwhere(slice_img == grain_id)
+            center = indices.mean(axis=0)  # center[0]: row, center[1]: column
+            
+            # TODO: this will fail if grain IDs are not continuous 1,2,3,4,...
+            R_matrix = rot.from_euler('ZXZ', self.angles[grain_id-1], degrees=True).as_matrix()
+            # Compute the 3D ellipsoid axes in the global frame
+            matrices = [np.diag([1, 1, 0.1]), np.diag([1, 0.1, 0.1])]
+            colors = ['white', 'red']
+            for i in range(2):
+                ellipsoid = R_matrix @ matrices[i]
+                if direction == 'x':
+                    ellipse = np.array([[0, 1, 0], [0, 0, 1]]) @ ellipsoid
+                elif direction == 'y':
+                    ellipse = np.array([[1, 0, 0], [0, 0, 1]]) @ ellipsoid
+                elif direction == 'z':
+                    ellipse = np.array([[1, 0, 0], [0, 1, 0]]) @ ellipsoid
+
+                U, S, Vt = np.linalg.svd(ellipse)
+                scale = (np.max([self.Nx, self.Ny, self.Nz]) / 20)
+                width = S[0] * scale  # full length (major axis)
+                height = S[1] * scale  # full length (minor axis)
+                angle_proj = np.degrees(np.arctan2(U[1, 0], U[0, 0]))
+
+                # Create the ellipse patch representing the projected ellipsoid.
+                patch = Ellipse((center[0], center[1]), width=width, height=height,
+                                angle=angle_proj, edgecolor="black", facecolor=colors[i], lw=1,\
+                                alpha=0.5)
+                ax.add_patch(patch)
+
+            # Optionally, overlay the grain ID.
+            if show_ids:
+                plt.text(center[0], center[1], str(int(grain_id)), color='blue', fontsize=12,
+                        ha='center', va='center')
+        
+        plt.axis('off')
+        plt.show()

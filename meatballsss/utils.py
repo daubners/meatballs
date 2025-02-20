@@ -22,6 +22,22 @@ def generate_fibonacci_points_on_sphere(num_points, radius):
     points = np.vstack((x, y * radius, z)).T
     return points
 
+def normalize_angles(raw_angles):
+    norm_angles = np.copy(raw_angles)
+    change_signs = norm_angles[:,0]<0
+    norm_angles[change_signs, 0] += 180
+    norm_angles[change_signs, 1] *= -1
+
+    change_signs = norm_angles[:,1]<0
+    norm_angles[change_signs, 1] += 180
+    norm_angles[change_signs, 2] *= -1
+
+    norm_angles[norm_angles[:,2]<0, 2] += 120
+    norm_angles[norm_angles[:,2]<0, 2] += 120
+    norm_angles[norm_angles[:,2]>=120, 2] -= 120
+    
+    return norm_angles
+
 def create_NMC_agglomerate(radii, num_seeds, padding=5, return_seeds=False):
     # Radii should be sorted from smallest to largest
     # If only one radius is given, then only create random meatball
@@ -58,17 +74,7 @@ def create_NMC_agglomerate(radii, num_seeds, padding=5, return_seeds=False):
         ypr_angles = np.column_stack((yaw, pitch, roll))
         rot_obj = rot.from_euler('ZYX', ypr_angles, degrees=True)
         bunge_angles = rot_obj.as_euler('ZXZ', degrees=True)
-        change_signs = bunge_angles[:,0]<0
-        bunge_angles[change_signs, 0] += 180
-        bunge_angles[change_signs, 1] *= -1
-
-        change_signs = bunge_angles[:,1]<0
-        bunge_angles[change_signs, 1] += 180
-        bunge_angles[change_signs, 2] *= -1
-
-        bunge_angles[bunge_angles[:,2]<0, 2] += 120
-        bunge_angles[bunge_angles[:,2]<0, 2] += 120
-        bunge_angles[bunge_angles[:,2]>=120, 2] -= 120
+        bunge_angles = normalize_angles(bunge_angles)
         angle_list[num_seeds[0]:,:] = bunge_angles
 
     # Shift seeds to box center

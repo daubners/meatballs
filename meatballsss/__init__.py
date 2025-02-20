@@ -7,4 +7,5 @@ __all__ = ['VoxelizedMeatball', \
            'PITTSolver']
 
 from .utils import create_NMC_agglomerate
-__all__.extend(['create_NMC_agglomerate'])
+from .metrics import plot_grain_alignment
+__all__.extend(['create_NMC_agglomerate', 'plot_grain_alignment'])

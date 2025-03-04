@@ -133,7 +133,7 @@ class VoxelizedMeatball:
         self.__initialize_grain_map(grains)
         self.angles = angles
 
-    def color_array_to_grain_map(self, img_array, tolerance=0):
+    def color_array_to_grain_map(self, img_array, tolerance=0, normalize_angles=None):
         """
         Convert a segmented color image to a grainmap with unique IDs.
         If the image is 2D (i.e. no explicit depth dimension), a pseudo-3D grain map is created
@@ -163,9 +163,19 @@ class VoxelizedMeatball:
         grains = inverse_indices.reshape(spatial_shape)
 
         if grains.ndim == 2:
-            grains = np.stack([grains, grains], axis=-1)
-        self.__initialize_grain_map(grains)
-        self.angles = None
+            self.__initialize_grain_map(np.stack([grains, grains], axis=-1))
+        else:
+            self.__initialize_grain_map(grains)
+
+        # TODO: this now assumes colorvalues between 0 and 1 for each channel
+        # TODO: make sure normalize_angles is list of three angles
+        if normalize_angles is not None:
+            self.angles = np.zeros((len(self.grain_ids), 3))
+            # normalize_angles = np.array(normalize_angles)
+            for i, label in enumerate(self.grain_ids):
+                self.angles[i] = normalize_angles*img_array[grains==label][0]
+        else:
+            self.angles = None
 
     def add_random_orientations(self, angle_range=[180,180,120]):
         if self.angles is not None:

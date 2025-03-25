@@ -104,7 +104,7 @@ class PITTSolver:
             self.data.export_fields_to_vtk(filename=filename, field_names=['concentration'])
         if verbose == 'plot':
             clear_output(wait=True)
-            self.data.plot_slice('concentration', slice, time=self.time)
+            self.data.plot_slice('concentration', slice, time=self.time, colormap='turbo')
 
     def gaussian_kernel_3d_torch(self, size=4, sigma=1.0):
         """Creates a 3D Gaussian kernel using PyTorch"""

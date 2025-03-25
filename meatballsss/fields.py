@@ -15,7 +15,7 @@ import warnings
 
 from IPython.display import clear_output
 from matplotlib.widgets import Slider
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Polygon
 from scipy.spatial.transform import Rotation as rot
 from skimage.segmentation import find_boundaries
 from sklearn.decomposition import PCA
@@ -44,6 +44,7 @@ class VoxelizedMeatball:
         Initializes the voxel agglomerate based on given grain map or empty.
         Parameters:
             grain_map (np.ndarray): A 3D numpy array of shape (Nx, Ny, Nz) where each voxel is labelled with a unique grain ID.
+                                    Electrolyte/ pore must have label '0'.
             angle_list (np.ndarray): List of orientations corresponding to labelled grains.
             spacing (tuple or list or np.ndarray): The voxel spacing in the x, y, z directions (dx, dy, dz).
         Raises:
@@ -159,6 +160,7 @@ class VoxelizedMeatball:
         
         # If a tolerance is set, additional post-processing would be required here.
         # For simplicity, we assume tolerance==0 (exact matching).
+        # TODO: mechanism that black is always background label 0
         _, inverse_indices = np.unique(pixels, axis=0, return_inverse=True)
         grains = inverse_indices.reshape(spatial_shape)
 
@@ -171,7 +173,7 @@ class VoxelizedMeatball:
         # TODO: make sure normalize_angles is list of three angles
         if normalize_angles is not None:
             self.angles = np.zeros((len(self.grain_ids), 3))
-            # normalize_angles = np.array(normalize_angles)
+            normalize_angles = np.array(normalize_angles)
             for i, label in enumerate(self.grain_ids):
                 self.angles[i] = normalize_angles*img_array[grains==label][0]
         else:
@@ -470,18 +472,30 @@ class VoxelizedMeatball:
         plt.ylabel(label2)
         plt.title(f'Slice {slice_index} along {direction}')
         ax = plt.gca()
+        label_to_index = {int(label): i for i, label in enumerate(self.grain_ids)}
+        scale = (np.max([self.Nx, self.Ny, self.Nz]) / 20)
 
         for grain_id in visible_grains:
             indices = np.argwhere(slice_img == grain_id)
             center = indices.mean(axis=0)  # center[0]: row, center[1]: column
             
-            # TODO: this will fail if grain IDs are not continuous 1,2,3,4,...
-            R_matrix = rot.from_euler('ZXZ', self.angles[grain_id-1], degrees=True).as_matrix()
+            R_matrix = rot.from_euler('ZXZ', self.angles[label_to_index[grain_id]], degrees=True).as_matrix()
+            hex_angles = np.deg2rad(np.arange(0, 360, 60))  # 0, 60, 120, ..., 300 degrees.
+            # The unit vectors in 3D (with zero z-component)
+            v = np.column_stack((np.cos(hex_angles), np.sin(hex_angles), np.zeros_like(hex_angles)))  # shape (6,3)
+            corners_3d = (R_matrix @ v.T).T
+            hex_vertices = corners_3d[:, :2]
+            hex_vertices = 0.5 * scale * hex_vertices + np.array(center)
+            hex_patch = Polygon(hex_vertices, closed=True, edgecolor="black", facecolor='white', lw=1, alpha=0.5)
+            ax.add_patch(hex_patch)
+            
             # Compute the 3D ellipsoid axes in the global frame
-            matrices = [np.diag([1, 1, 0.1]), np.diag([1, 0.1, 0.1])]
-            colors = ['white', 'red']
-            for i in range(2):
-                ellipsoid = R_matrix @ matrices[i]
+            matrices = [np.diag([1, 0.05, 0.05]), \
+                rot.from_euler('z', 120, degrees=True).as_matrix() @ np.diag([1, 0.05, 0.05]), \
+                rot.from_euler('z', -120, degrees=True).as_matrix() @ np.diag([1, 0.05, 0.05])]
+            ellipsoids = [R_matrix @ M for M in matrices]
+
+            for ellipsoid in ellipsoids:
                 if direction == 'x':
                     ellipse = np.array([[0, 1, 0], [0, 0, 1]]) @ ellipsoid
                 elif direction == 'y':
@@ -489,15 +503,14 @@ class VoxelizedMeatball:
                 elif direction == 'z':
                     ellipse = np.array([[1, 0, 0], [0, 1, 0]]) @ ellipsoid
 
-                U, S, Vt = np.linalg.svd(ellipse)
-                scale = (np.max([self.Nx, self.Ny, self.Nz]) / 20)
-                width = S[0] * scale  # full length (major axis)
-                height = S[1] * scale  # full length (minor axis)
+                U, S, _ = np.linalg.svd(ellipse)
                 angle_proj = np.degrees(np.arctan2(U[1, 0], U[0, 0]))
 
                 # Create the ellipse patch representing the projected ellipsoid.
+                width = S[0] * scale  # full length (major axis)
+                height = S[1] * scale  # full length (minor axis)
                 patch = Ellipse((center[0], center[1]), width=width, height=height,
-                                angle=angle_proj, edgecolor="black", facecolor=colors[i], lw=1,\
+                                angle=angle_proj, edgecolor="gray", facecolor="red", lw=1,\
                                 alpha=0.5)
                 ax.add_patch(patch)
 

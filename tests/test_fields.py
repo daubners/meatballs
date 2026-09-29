@@ -2,11 +2,16 @@
 
 import numpy as np
 import meatballsss as mbs
+from evoxels import VoxelFields
 
 def test_voxelFields_init():
     test = np.ones((2,3,4))
     agglomerate = mbs.VoxelizedMeatball(grain_map=test)
+    assert isinstance(agglomerate, VoxelFields)
     assert (agglomerate.Nx, agglomerate.Ny, agglomerate.Nz) == (2,3,4)
+    assert agglomerate.grid_info().shape == (2,3,4)
+    assert mbs.VoxelizedMeatball.plot_slice is VoxelFields.plot_slice
+    assert mbs.VoxelizedMeatball.plot_field_interactive is VoxelFields.plot_field_interactive
 
 def test_voxelFields_init_domain():
     test = np.ones((2,3,4))

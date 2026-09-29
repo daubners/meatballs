@@ -1,5 +1,6 @@
 # meatballsss
 Structure simulation solver for NMC particles (meatballs)
+Requires Python 3.9 or newer.
 
 
 ## Installation

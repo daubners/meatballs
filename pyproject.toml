@@ -1,3 +1,42 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "meatballsss"
+version = "0.1.0"
+description = "Structure simulation solver for NMC particles (meatballs)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Simon Daubner", email = "s.daubner@imperial.ac.uk" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Environment :: GPU",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "ipython",
+    "matplotlib",
+    "numpy",
+    "psutil",
+    "pyvista",
+    "scikit-image",
+    "scikit-learn",
+    "scipy",
+    "evoxels[torch]>=1,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]

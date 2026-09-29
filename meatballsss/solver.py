@@ -1,9 +1,9 @@
 from IPython.display import clear_output
 # import matplotlib.pyplot as plt
 import numpy as np
-# import sys
+import sys
 from timeit import default_timer as timer
-# import psutil
+import psutil
 from scipy.spatial.transform import Rotation as rot
 import torch
 import torch.fft as fft
@@ -104,7 +104,7 @@ class PITTSolver:
             self.data.export_fields_to_vtk(filename=filename, field_names=['concentration'])
         if verbose == 'plot':
             clear_output(wait=True)
-            self.data.plot_slice('concentration', slice, time=self.time, colormap='turbo')
+            self.data.plot_slice('concentration', slice, colormap='turbo')
 
     def gaussian_kernel_3d_torch(self, size=4, sigma=1.0):
         """Creates a 3D Gaussian kernel using PyTorch"""

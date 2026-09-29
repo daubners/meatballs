@@ -33,13 +33,8 @@ class PITTProblem(SemiLinearODE):
         if size % 2:
             warnings.warn("Kernel size must be even number")
 
-        rotations = rot.from_euler("ZXZ", data.angles, degrees=True).as_matrix()
-        D_grains = rotations @ self.D_material @ np.swapaxes(rotations, -1, -2)
-        D_components = vg.torch.tensor(
-            D_grains[:, (0, 0, 0, 1, 1, 2), (0, 1, 2, 1, 2, 2)],
-            dtype=vg.precision,
-            device=vg.device,
-        )
+        D_grains = self.rotate_crystal_diffusivity_to_reference(data.angles)
+        D_components = D_grains[:, (0, 0, 0, 1, 1, 2), (0, 1, 2, 1, 2, 2)]
         labels = self.grains
         grain_ids = vg.to_backend(data.grain_ids)
         indices = vg.torch.searchsorted(grain_ids, labels)
@@ -103,7 +98,7 @@ class PITTProblem(SemiLinearODE):
         # Transformation of e.g. the material-specific diffusion tensor into the reference space is given by
         # D_xyz = R * D_abc * R^T where R = [q_z(phi2) * q_x(Phi) * q_z(phi1)]^T
         r_matrix = rot.from_euler(convention, bunge_angles, degrees=degrees).as_matrix()
-        D_xyz = r_matrix @ self.D_material @ r_matrix.T
+        D_xyz = r_matrix @ self.D_material @ np.swapaxes(r_matrix, -1, -2)
         return self.vg.torch.tensor(D_xyz, dtype=self.vg.precision, device=self.vg.device)
 
     def rhs(self, t, u):

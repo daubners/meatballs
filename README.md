@@ -5,7 +5,7 @@
 
 GPU-accelerated, microstructure-resolved simulations of anisotropic transport in polycrystalline NMC agglomerates.
 
-![Voxelized polycrystalline NMC agglomerate](meatballs.png)
+<img src="meatballs.png" alt="Voxelized polycrystalline NMC agglomerate" width="520">
 
 ## Description
 

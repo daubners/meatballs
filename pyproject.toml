@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meatballsss"
+name = "meatballs"
 version = "0.1.0"
-description = "Structure simulation solver for NMC particles (meatballs)"
+description = "Code library for analysis and simulation of polycrystalline NMC agglomerates"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }

@@ -1,7 +1,7 @@
 """Tests for field handling with VoxelFields class."""
 
 import numpy as np
-import meatballsss as mbs
+import meatballs as mbs
 from evoxels import VoxelFields
 
 def test_voxelFields_init():

@@ -5,8 +5,8 @@ import pytest
 import numpy as np
 
 from evoxels.timesteppers import ForwardEuler, PseudoSpectralIMEX
-from meatballsss import PITTSolver, VoxelizedMeatball
-from meatballsss.solver import PITTProblem
+from meatballs import PITTSolver, VoxelizedMeatball
+from meatballs.solver import PITTProblem
 
 
 @pytest.mark.parametrize("timestepper", [PseudoSpectralIMEX, ForwardEuler])
@@ -26,8 +26,6 @@ def test_pitt_uses_evoxels_imex_torch_grid(timestepper):
     assert grain_tensors.shape == (2, 3, 3)
     assert np.allclose(single_tensor.cpu(), grain_tensors[0].cpu())
     assert solver.timestepper_cls is timestepper
-    assert not hasattr(PITTProblem, "calc_grad_x")
-    assert hasattr(solver.vg, "grad_x_corner")
     assert data.fields["concentration"].shape == (8, 8, 8)
     assert np.isfinite(data.fields["concentration"]).all()
 

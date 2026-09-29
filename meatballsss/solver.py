@@ -1,139 +1,88 @@
-from IPython.display import clear_output
-# import matplotlib.pyplot as plt
 import numpy as np
-import sys
-from timeit import default_timer as timer
-import psutil
 from scipy.spatial.transform import Rotation as rot
-import torch
-import torch.fft as fft
 import torch.nn.functional as F
 import warnings
+
+from evoxels.pdes import SemiLinearODE
+from evoxels.solvers import TimeDependentSolver
+from evoxels.timesteppers import PseudoSpectralIMEX
+
 from .fields import VoxelizedMeatball
 
-class PITTSolver:
-    def __init__(self, data: VoxelizedMeatball, diffusivity=None, size=4, sigma=1.0, device='cuda'):
-        """
-        Solves concentration evolution for anisotropic diffusion in polycrystalline agglomerate.
 
-        Args:
-            data (VoxelizedMeatball): The voxel agglomerate object containing spatial and field information.
-            device (str): The device to perform computations ('cpu' or 'cuda').
-        """
+class PITTProblem(SemiLinearODE):
+    """PITT's anisotropic diffusion equation on an evoxels torch grid."""
+
+    def __init__(self, vg, data, diffusivity=None, size=4, sigma=1.0, A=0.25):
+        self.vg = vg
         self.data = data
-        data.add_field('concentration')
-        self.device = torch.device(device)
-        # check device is available
-        if torch.device(device).type.startswith('cuda') and not torch.cuda.is_available():
-            self.device = torch.device('cpu')
-            warnings.warn("CUDA not available, defaulting device to cpu. To avoid this warning, set device=torch.device('cpu')")
-        self.precision = torch.float32 # torch.float64
+        self.bc = "fully_periodic"
+        self.initialize_boundary_conditions()
+        self._fourier_symbol = -A * self.k_squared()
+        self.grains = vg.to_backend(data.fields["grains"])
 
-        self.grains = torch.tensor(data.fields['grains'], dtype=self.precision, device=self.device)
-        self.electrolyte = (self.grains == 0).float()
-        self.electrolyte[self.electrolyte==1] = torch.inf
-        self.electrolyte[self.electrolyte==0] = 1
-        self.c = torch.zeros_like(self.grains)
-        self.electrolyte = self.electrolyte.unsqueeze(0)
-
-        if not diffusivity:
+        if diffusivity is None:
             self.D_material = np.eye(3)
+        elif isinstance(diffusivity, (list, tuple)) and len(diffusivity) == 3:
+            self.D_material = np.diag(diffusivity)
         else:
-            if not isinstance(diffusivity, (list, tuple)) or len(diffusivity) != 3:
-                raise ValueError("Crystal diffusivity must be given as list [D_a, D_b, D_c]")
-            self.D_material = np.eye(3)
-            self.D_material[0,0] = diffusivity[0]
-            self.D_material[1,1] = diffusivity[1]
-            self.D_material[2,2] = diffusivity[2]
+            raise ValueError("Crystal diffusivity must be given as list [D_a, D_b, D_c]")
 
-        # Diffusivities and fluxes are defined at cell corners
-        # TODO: refactor this lengthy bit
-        self.Dxx = torch.zeros(self.data.Nx-1, self.data.Ny-1, self.data.Nz-1, dtype=self.precision, device=self.device)
-        self.Dxy = torch.zeros(self.data.Nx-1, self.data.Ny-1, self.data.Nz-1, dtype=self.precision, device=self.device)
-        self.Dxz = torch.zeros(self.data.Nx-1, self.data.Ny-1, self.data.Nz-1, dtype=self.precision, device=self.device)
-        self.Dyy = torch.zeros(self.data.Nx-1, self.data.Ny-1, self.data.Nz-1, dtype=self.precision, device=self.device)
-        self.Dyz = torch.zeros(self.data.Nx-1, self.data.Ny-1, self.data.Nz-1, dtype=self.precision, device=self.device)
-        self.Dzz = torch.zeros(self.data.Nx-1, self.data.Ny-1, self.data.Nz-1, dtype=self.precision, device=self.device)
-
-        if size % 2 > 0:
-            warnings.warn("Kernel size must be even number")
-        pad_size = int((size-2)/2)
-        gaussian = self.gaussian_kernel_3d_torch(size=size, sigma=sigma)
-        
         if data.angles is None:
             raise ValueError("VoxelizedMeatball object has no grain orientations! Create orientations before trying to simulate.")
+        if size % 2:
+            warnings.warn("Kernel size must be even number")
 
-        for i, label in enumerate(data.grain_ids):
-            # sub_tensor, indices = self.crop_area_of_interest_torch(tensor, label)
-            # Create binary mask for the label within the slice
-            # mask = (sub_tensor == label).float()
-            mask = (self.grains == label).float()
-            mask = mask.unsqueeze(0).unsqueeze(0)
-            mask = F.pad(mask, (pad_size,pad_size,pad_size,pad_size,pad_size,pad_size), mode='replicate')
-            mask = F.conv3d(mask, gaussian, padding='valid')
-            mask = mask.squeeze(0).squeeze(0)
-            D_grain = self.rotate_crystal_diffusivity_to_reference(data.angles[i], convention='ZXZ', degrees=True)
-            self.Dxx += mask*D_grain[0,0]
-            self.Dxy += mask*D_grain[0,1]
-            self.Dxz += mask*D_grain[0,2]
-            self.Dyy += mask*D_grain[1,1]
-            self.Dyz += mask*D_grain[1,2]
-            self.Dzz += mask*D_grain[2,2]
+        rotations = rot.from_euler("ZXZ", data.angles, degrees=True).as_matrix()
+        D_grains = rotations @ self.D_material @ np.swapaxes(rotations, -1, -2)
+        D_components = vg.torch.tensor(
+            D_grains[:, (0, 0, 0, 1, 1, 2), (0, 1, 2, 1, 2, 2)],
+            dtype=vg.precision,
+            device=vg.device,
+        )
+        labels = self.grains
+        grain_ids = vg.to_backend(data.grain_ids)
+        indices = vg.torch.searchsorted(grain_ids, labels)
+        D_cells = vg.torch.zeros_like(self.grains)
+        active = labels > 0
+        pad_size = (size - 2) // 2
+        kernel = self.gaussian_kernel_3d_torch(size, sigma)
+        for component, name in enumerate(("Dxx", "Dxy", "Dxz", "Dyy", "Dyz", "Dzz")):
+            D_cells.zero_()
+            D_cells[active] = D_components[indices[active], component]
+            D_corner = F.conv3d(
+                F.pad(D_cells[None, None], (pad_size,) * 6, mode="replicate"),
+                kernel,
+                padding="valid",
+            ).squeeze(0).squeeze(0)
+            setattr(self, name, D_corner)
+        del D_cells, D_components, indices, active
 
-        # TODO: correction at interface
-        # self.Dxx = Dxx/ phi_active
-        
-    def print_memory_stats(self, start, end, iters):
-        print(f'Wall time: {np.around(end - start, 4)} s ({np.around((end - start)/iters, 4)} s/iter)')
-        if self.device.type == 'cuda':
-            print(f"GPU-RAM currently allocated {torch.cuda.memory_allocated(device=self.device) / 1e6:.2f} MB ({torch.cuda.memory_reserved(device=self.device) / 1e6:.2f} MB reserved)")
-            print(f"GPU-RAM maximally allocated {torch.cuda.max_memory_allocated(device=self.device) / 1e6:.2f} MB ({torch.cuda.max_memory_reserved(device=self.device) / 1e6:.2f} MB reserved)")
-        elif self.device.type == 'cpu':
-            memory_info = psutil.virtual_memory()
-            print(f"CPU total memory: {memory_info.total / 1e6:.2f} MB")
-            print(f"CPU available memory: {memory_info.available / 1e6:.2f} MB")
-            print(f"CPU used memory: {memory_info.used / 1e6:.2f} MB")
+        self.electrolyte = (self.grains == 0).float()
+        self.electrolyte[self.electrolyte == 1] = float("inf")
+        self.electrolyte[self.electrolyte == 0] = 1
+        self.electrolyte = self.electrolyte.unsqueeze(0)
 
-    def handle_outputs(self, vtk_out, verbose, slice=0):
-        self.data.fields['concentration'] = self.c.squeeze().cpu().numpy()
-        if np.isnan(self.data.fields['concentration']).any():
-            print(f"NaN detected in frame {self.frame} at time {self.time}. Aborting simulation.")
-            sys.exit(1)  # Exit the program with an error status
-        if vtk_out:
-            filename = f"PITT_c_{self.frame:03d}.vtk"
-            self.data.export_fields_to_vtk(filename=filename, field_names=['concentration'])
-        if verbose == 'plot':
-            clear_output(wait=True)
-            self.data.plot_slice('concentration', slice, colormap='turbo')
+    @property
+    def order(self):
+        return 2
 
-    def gaussian_kernel_3d_torch(self, size=4, sigma=1.0):
-        """Creates a 3D Gaussian kernel using PyTorch"""
-        ax = torch.linspace(-(size // 2), size // 2, size)
-        xx, yy, zz = torch.meshgrid(ax, ax, ax, indexing="ij")
+    @property
+    def fourier_symbol(self):
+        return self._fourier_symbol
 
-        # Calculate Gaussian function for each point in the grid
-        kernel = torch.exp(-(xx**2 + yy**2 + zz**2) / (2 * sigma**2))
-        kernel /= kernel.sum()
-        kernel = kernel.to(self.device)
-        return kernel.unsqueeze(0).unsqueeze(0)
-    
-    def crop_area_of_interest_torch(self, tensor, labels):
-        indices = torch.nonzero(torch.isin(tensor, labels), as_tuple=True)
-        min_idx = [torch.min(idx).item() for idx in indices]
-        max_idx = [torch.max(idx).item() for idx in indices]
+    def rhs_analytic(self, t, u):
+        raise NotImplementedError("PITT's voxelwise diffusivity has no symbolic RHS.")
 
-        # Slice the tensor to the bounding box
-        # Make sure to stay inside the bounds of total array
-        box_idx = (slice(max(min_idx[0] - 3, 0), min(max_idx[0] + 4, tensor.shape[0])),
-                  slice(max(min_idx[1] - 3, 0), min(max_idx[1] + 4, tensor.shape[1])),
-                  slice(max(min_idx[2] - 3, 0), min(max_idx[2] + 4, tensor.shape[2]))
-                 )
-        sub_tensor = tensor[box_idx]
-        return sub_tensor, box_idx
-    
+    def gaussian_kernel_3d_torch(self, size, sigma):
+        ax = self.vg.torch.linspace(-(size // 2), size // 2, size, device=self.vg.device)
+        xx, yy, zz = self.vg.torch.meshgrid(ax, ax, ax, indexing="ij")
+        kernel = self.vg.torch.exp(-(xx**2 + yy**2 + zz**2) / (2 * sigma**2))
+        return (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)
+
     def rotate_crystal_diffusivity_to_reference(self, bunge_angles, convention='ZXZ', degrees=True):
         # In the Bunge-Euler convention, the orientation of a crystal is represented by three Euler angles:
-        # φ1 (phi1), Φ (Phi), and φ2 (phi2). These angles describe the rotations needed to bring 
+        # φ1 (phi1), Φ (Phi), and φ2 (phi2). These angles describe the rotations needed to bring
         # a crystal from a standard reference orientation to its current orientation.
         # Here's a brief explanation of each angle:
         #  φ1 (phi1): Rotation angle about the Z-axis of the standard reference frame.
@@ -153,101 +102,70 @@ class PITTSolver:
 
         # Transformation of e.g. the material-specific diffusion tensor into the reference space is given by
         # D_xyz = R * D_abc * R^T where R = [q_z(phi2) * q_x(Phi) * q_z(phi1)]^T
-
         r_matrix = rot.from_euler(convention, bunge_angles, degrees=degrees).as_matrix()
         D_xyz = r_matrix @ self.D_material @ r_matrix.T
-        return torch.tensor(D_xyz, dtype=self.precision, device=self.device)
+        return self.vg.torch.tensor(D_xyz, dtype=self.vg.precision, device=self.vg.device)
 
-    def initialise_FFT_wavenumbers(self):
-        dx, dy, dz = self.data.spacing
-        kx = 2 * torch.pi * fft.fftfreq(self.data.Nx, d=dx, device=self.device)
-        ky = 2 * torch.pi * fft.fftfreq(self.data.Ny, d=dy, device=self.device)
-        kz = 2 * torch.pi * fft.fftfreq(self.data.Nz, d=dz, device=self.device)
-        kx, ky, kz = torch.meshgrid(kx, ky, kz, indexing="ij")
+    def rhs(self, t, u):
+        grad = self.vg.grad_x_corner(u)
+        flux_x = self.Dxx * grad
+        flux_y = self.Dxy * grad
+        flux_z = self.Dxz * grad
 
-        return kx, ky, kz, kx**2 + ky**2 + kz**2
+        grad = self.vg.grad_y_corner(u)
+        flux_x += self.Dxy * grad
+        flux_y += self.Dyy * grad
+        flux_z += self.Dyz * grad
 
-    def calc_grad_x(self, tensor):
-        return (  tensor[:, 1: , 1: , 1:] + tensor[:, 1: , 1: , :-1] \
-                + tensor[:, 1: , :-1, 1:] + tensor[:, 1: , :-1, :-1] \
-                - tensor[:, :-1, 1: , 1:] - tensor[:, :-1, 1: , :-1] \
-                - tensor[:, :-1, :-1, 1:] - tensor[:, :-1, :-1, :-1] ) / 4
-    
-    def calc_grad_y(self, tensor):
-        return (  tensor[:, 1: , 1: , 1:] + tensor[:, 1: , 1: , :-1] \
-                + tensor[:, :-1, 1: , 1:] + tensor[:, :-1, 1: , :-1] \
-                - tensor[:, 1: , :-1, 1:] - tensor[:, 1: , :-1, :-1] \
-                - tensor[:, :-1, :-1, 1:] - tensor[:, :-1, :-1, :-1] ) / 4
+        grad = self.vg.grad_z_corner(u)
+        flux_x += self.Dxz * grad
+        flux_y += self.Dyz * grad
+        flux_z += self.Dzz * grad
 
-    def calc_grad_z(self, tensor):
-        return (  tensor[:, 1: , 1:, 1: ] + tensor[:, 1: , :-1 , 1:] \
-                + tensor[:, :-1, 1:, 1: ] + tensor[:, :-1, :-1 , 1:] \
-                - tensor[:, 1: , 1:, :-1] - tensor[:, 1: , :-1, :-1] \
-                - tensor[:, :-1, 1:, :-1] - tensor[:, :-1, :-1, :-1] ) / 4
+        flux_x = F.pad(flux_x, (1,) * 6, mode="constant")
+        flux_y = F.pad(flux_y, (1,) * 6, mode="constant")
+        flux_z = F.pad(flux_z, (1,) * 6, mode="constant")
 
-    def solve(self, time_increment=0.01, frames=10, max_iters=1000, bc=1, A = 0.25, verbose=True, vtk_out=False):
-        """
-        Solves concentration evolution using explicit timestepping.
-        """
-        if self.device.type == 'cuda':
-            torch.cuda.reset_peak_memory_stats(device=self.device)
-        self.n_out = int(max_iters/frames)
-        self.frame = 0
-        self.time = 0
-        _, _, _, k_squared = self.initialise_FFT_wavenumbers()
-        self.c[self.grains == 0] = bc
-        self.c = self.c.unsqueeze(0)
-        slice = int(self.c.shape[-1]/2)
-        with torch.no_grad():
-            start = timer()
-            for i in range(max_iters):
-                # Apply electrolyte boundary conditions
-                # Set c=bc in all electrolyte cells
-                # self.c *= (1-self.electrolyte)
-                # self.c += self.electrolyte * bc
-                
-                if i % self.n_out == 0:
-                    self.time = i*time_increment
-                    self.handle_outputs(vtk_out, verbose, slice=slice)
-                    self.frame += 1
+        divergence = (self.vg.grad_x_corner(flux_x) + \
+                      self.vg.grad_y_corner(flux_y) + \
+                      self.vg.grad_z_corner(flux_z)) / self.electrolyte
+        return divergence
 
-                grad = self.calc_grad_x(self.c)
-                flux_x = self.Dxx*grad
-                flux_y = self.Dxy*grad
-                flux_z = self.Dxz*grad
 
-                grad = self.calc_grad_y(self.c)
-                flux_x += self.Dxy*grad
-                flux_y += self.Dyy*grad
-                flux_z += self.Dyz*grad
+class PITTSolver(TimeDependentSolver):
+    """Solve PITT concentration evolution with evoxels' IMEX timestepper."""
 
-                grad = self.calc_grad_z(self.c)            
-                flux_x += self.Dxz*grad
-                flux_y += self.Dyz*grad
-                flux_z += self.Dzz*grad
+    def __init__(self, data: VoxelizedMeatball, diffusivity=None, size=4, sigma=1.0, device="cuda", timestepper=PseudoSpectralIMEX, interpolation="arithmetic"):
+        if interpolation != "arithmetic":
+            raise ValueError("Only arithmetic interpolation is implemented.")
+        self.data = data
+        data.add_field("concentration")
+        self._problem_kwargs = {
+            "data": data,
+            "diffusivity": diffusivity,
+            "size": size,
+            "sigma": sigma,
+        }
+        super().__init__(
+            vf=data,
+            fieldnames="concentration",
+            backend="torch",
+            problem_cls=PITTProblem,
+            timestepper_cls=timestepper,
+            device=device,
+        )
 
-                # Add Neumann boundary conditions
-                flux_x = F.pad(flux_x, (1,1,1,1,1,1), mode='constant')
-                flux_y = F.pad(flux_y, (1,1,1,1,1,1), mode='constant')
-                flux_z = F.pad(flux_z, (1,1,1,1,1,1), mode='constant')
-
-                # self.c += time_increment * (self.calc_grad_x(flux_x) + \
-                #                             self.calc_grad_y(flux_y) + \
-                #                             self.calc_grad_z(flux_z) ) /self.electrolyte
-                divergence = (self.calc_grad_x(flux_x) + \
-                              self.calc_grad_y(flux_y) + \
-                              self.calc_grad_z(flux_z) ) /self.electrolyte
-                flux_div = fft.fftn(divergence)
-
-                c_hat = fft.fftn(self.c)
-                # Update c_hat using semi-implicit scheme
-                c_hat += time_increment*flux_div / (1 + time_increment*k_squared*A)
-
-                # Transform back to real space
-                self.c = torch.real(fft.ifftn(c_hat))
-
-            end = timer()
-            self.time = max_iters*time_increment
-            self.handle_outputs(vtk_out, verbose, slice=slice)
-            if verbose:
-                self.print_memory_stats(start, end, max_iters)
+    def solve(self, time_increment=0.01, frames=10, max_iters=1000, bc=1, A=0.25,
+              verbose=True, vtk_out=False):
+        self.data.fields["concentration"][self.data.fields["grains"] == 0] = bc
+        self._problem_kwargs["A"] = A
+        return super().solve(
+            time_increment=time_increment,
+            frames=frames,
+            max_iters=max_iters,
+            problem_kwargs=self._problem_kwargs,
+            jit=False,
+            verbose=verbose,
+            vtk_out=vtk_out,
+            colormap="turbo",
+        )

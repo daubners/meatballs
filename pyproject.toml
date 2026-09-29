@@ -35,7 +35,7 @@ dependencies = [
     "scikit-image",
     "scikit-learn",
     "scipy",
-    "evoxels[torch]>=1,<2",
+    "evoxels[torch]>=1.1.0,<2",
 ]
 
 [project.optional-dependencies]
